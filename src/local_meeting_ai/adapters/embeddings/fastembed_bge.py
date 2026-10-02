@@ -4,6 +4,7 @@ import asyncio
 import gc
 import importlib
 import importlib.util
+import os
 import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -13,6 +14,11 @@ from typing import Any, cast
 from local_meeting_ai.domain.errors import CapabilityUnavailableError, ValidationError
 
 BGE_M3_MODEL = "BAAI/bge-m3"
+BGE_M3_REQUIRED_FILES = (
+    "onnx/model.onnx",
+    "onnx/model.onnx_data",
+    "onnx/Constant_7_attr__value",
+)
 
 
 class FastEmbedBgeM3Provider:
@@ -156,12 +162,23 @@ class FastEmbedBgeM3Provider:
         try:
             text_embedding = self._text_embedding_class()
             threads = int(config.get("threads", 0)) or None
+            if not self._local_model_complete():
+                # Download (or locate) the Hugging Face snapshot without opening it.
+                text_embedding(
+                    model_name=BGE_M3_MODEL,
+                    cache_dir=str(self.models_dir),
+                    cuda=False,
+                    lazy_load=True,
+                    local_files_only=not allow_model_download,
+                )
+                self._materialize_local_model()
             model = text_embedding(
                 model_name=BGE_M3_MODEL,
                 cache_dir=str(self.models_dir),
                 threads=threads,
                 cuda=False,
-                local_files_only=not allow_model_download,
+                local_files_only=True,
+                specific_model_path=str(self._local_model_dir),
             )
             # Force lazy runtimes to validate the graph and external weights now.
             list(model.embed(["Meet2Notes BGE-M3 warmup"], batch_size=1))
@@ -205,15 +222,62 @@ class FastEmbedBgeM3Provider:
             )
         return text_embedding
 
-    def _installed(self) -> bool:
+    @property
+    def _local_model_dir(self) -> Path:
+        return self.models_dir / "bge-m3-onnx"
+
+    @staticmethod
+    def _complete(directory: Path) -> bool:
+        return all((directory / name).is_file() for name in BGE_M3_REQUIRED_FILES)
+
+    def _local_model_complete(self) -> bool:
+        return self._complete(self._local_model_dir)
+
+    def _snapshot_dirs(self) -> list[Path]:
         cache = self.models_dir / "models--BAAI--bge-m3"
-        graphs = list(cache.glob("snapshots/*/onnx/model.onnx"))
-        return any(
-            graph.is_file()
-            and graph.with_name("model.onnx_data").is_file()
-            and graph.with_name("Constant_7_attr__value").is_file()
-            for graph in graphs
-        )
+        snapshots = [path for path in cache.glob("snapshots/*") if self._complete(path)]
+        ref = cache / "refs" / "main"
+        preferred = ref.read_text(encoding="utf-8").strip() if ref.is_file() else ""
+        return sorted(snapshots, key=lambda path: path.name != preferred)
+
+    def _installed(self) -> bool:
+        return self._local_model_complete() or bool(self._snapshot_dirs())
+
+    def _materialize_local_model(self) -> None:
+        """Copy the snapshot into a flat folder of regular files.
+
+        The Hugging Face cache stores snapshot files as symlinks into separate blob
+        folders. Recent ONNX Runtime releases resolve those links and reject
+        ``model.onnx_data`` because it no longer sits next to ``model.onnx``.
+        Hard links are used when possible so the weights are not stored twice.
+        """
+        snapshots = self._snapshot_dirs()
+        if not snapshots:
+            raise CapabilityUnavailableError(
+                "BGE-M3 download did not produce the expected ONNX files"
+            )
+        source_root = snapshots[0]
+        target_root = self._local_model_dir
+        for source in source_root.rglob("*"):
+            if not source.is_file():
+                continue
+            relative = source.relative_to(source_root)
+            target = target_root / relative
+            real_source = source.resolve()
+            if (
+                target.is_file()
+                and not target.is_symlink()
+                and target.stat().st_size == real_source.stat().st_size
+            ):
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            staging = target.with_name(f"{target.name}.partial")
+            staging.unlink(missing_ok=True)
+            try:
+                os.link(real_source, staging)
+            except OSError:
+                shutil.copyfile(real_source, staging)
+            os.replace(staging, target)
 
     def _unload_sync(self) -> None:
         with self._lock:
@@ -230,6 +294,9 @@ class FastEmbedBgeM3Provider:
             raise ValidationError("Refusing to remove a model outside the managed folder")
         if target.is_dir():
             shutil.rmtree(target)
+        local = self._local_model_dir.resolve()
+        if local.parent == root and local.is_dir():
+            shutil.rmtree(local)
 
     def _set_error(self, error: Exception) -> None:
         with self._lock:

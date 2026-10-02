@@ -307,6 +307,71 @@ def test_fastembed_registers_bge_m3_without_downloading(tmp_path: Path) -> None:
     assert provider.capability({})["installed"] is False
 
 
+def test_fastembed_loads_bge_m3_from_regular_files_not_cache_symlinks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = FastEmbedBgeM3Provider(tmp_path)
+    cache = provider.models_dir / "models--BAAI--bge-m3"
+    snapshot = cache / "snapshots" / "abc123"
+    calls: list[dict[str, Any]] = []
+
+    class FakeVector:
+        def tolist(self) -> list[float]:
+            return [1.0]
+
+    class FakeTextEmbedding:
+        def __init__(self, **kwargs: Any) -> None:
+            calls.append(kwargs)
+            if kwargs.get("lazy_load"):
+                # Mimic the Hugging Face cache: snapshot entries link into blobs/.
+                for index, name in enumerate(
+                    [
+                        "onnx/model.onnx",
+                        "onnx/model.onnx_data",
+                        "onnx/Constant_7_attr__value",
+                        "tokenizer.json",
+                    ]
+                ):
+                    blob = cache / "blobs" / f"{index:02d}" / f"blob{index}"
+                    blob.parent.mkdir(parents=True, exist_ok=True)
+                    blob.write_bytes(name.encode())
+                    link = snapshot / name
+                    link.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        link.symlink_to(blob)
+                    except OSError:
+                        link.write_bytes(blob.read_bytes())
+                (cache / "refs").mkdir(parents=True, exist_ok=True)
+                (cache / "refs" / "main").write_text("abc123", encoding="utf-8")
+                return
+            local = Path(kwargs["specific_model_path"])
+            for name in ["onnx/model.onnx", "onnx/model.onnx_data", "tokenizer.json"]:
+                assert (local / name).is_file()
+                assert not (local / name).is_symlink()
+                assert (local / name).resolve().parent == (local / name).parent.resolve()
+
+        def embed(self, texts: list[str], batch_size: int) -> list[FakeVector]:
+            return [FakeVector() for _ in texts]
+
+    monkeypatch.setattr(
+        FastEmbedBgeM3Provider,
+        "_text_embedding_class",
+        staticmethod(lambda: FakeTextEmbedding),
+    )
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: object())
+    try:
+        provider._ensure_model({}, True)
+        provider._unload_sync()
+        provider._ensure_model({}, False)
+    finally:
+        provider.shutdown()
+
+    assert [call.get("lazy_load", False) for call in calls] == [True, False, False]
+    assert calls[1]["local_files_only"] is True
+    assert provider.capability({})["installed"] is True
+
+
 def test_prompt_accepts_raw_transcript_and_summary_attachments(settings: AppSettings) -> None:
     summary_engine = RecordingSummaryEngine()
     with TestClient(
